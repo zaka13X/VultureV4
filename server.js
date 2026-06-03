@@ -1,42 +1,101 @@
-const hammerhead = require('testcafe-hammerhead');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const https = require('https');
+const { URL } = require('url');
+const WebSocket = require('ws');
 
-// 1. Initialize Hammerhead Proxy Server
-const proxy = hammerhead.createProxyServer(1337, '127.0.0.1');
+const PORT = process.env.PORT || 10000;
+const server = http.createServer((req, res) => {
+    // Enable CORS for frontend flexibility
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
 
-// 2. Load your Custom HTML Workspace
-const workspaceHtmlPath = path.join(__dirname, 'workspace.html');
-const workspaceHtml = fs.readFileSync(workspaceHtmlPath, 'utf8');
-
-proxy.server.on('request', (req, res) => {
-    // 3. Strip specific forwarding headers
-    req.headers['x-forwarded-for'] = '';
-    req.headers['cf-connecting-ip'] = '';
-
-    const url = new URL(req.url, `http://${req.headers.host}`);
-
-    // 4. Route requests through /education and decode Base64
-    if (url.pathname.startsWith('/education/')) {
-        const base64EncodedPart = url.pathname.split('/education/')[1];
-        try {
-            const decodedUrl = Buffer.from(base64EncodedPart, 'base64').toString('utf8');
-            // Re-route Hammerhead proxy session to the decoded destination
-            req.url = `/${proxy.getProxyUrl(decodedUrl)}${url.search}`;
-        } catch (e) {
-            // Fallthrough if base64 decoding fails
-        }
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
     }
 
-    // 5. Serve the provided HTML if the user is requesting the homepage
-    if (req.url === '/' || req.url === '/index.html') {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(workspaceHtml);
-    } else {
-        // Let Hammerhead process proxied pages and assets natively
-        proxy.handleRequest(req, res);
-    }
+    // Fallback basic HTTP handler for initial payload serving
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Proxy Server Running. Connect via WebSockets.');
 });
 
-console.log('Vulture Workspace proxy is running on http://127.0.0.1:1337');
+// Establish the WebSocket Server
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws) => {
+    ws.on('message', async (message) => {
+        try {
+            const packet = JSON.parse(message);
+            
+            // Handle standard HTTP requests over WebSocket tunnel
+            if (packet.type === 'request') {
+                handleTunneledRequest(ws, packet);
+            }
+        } catch (err) {
+            ws.send(JSON.stringify({ type: 'error', message: err.message }));
+        }
+    });
+});
+
+async function handleTunneledRequest(ws, packet) {
+    const { id, url, method, headers, body } = packet;
+    
+    try {
+        const targetUrl = new URL(url);
+        const options = {
+            method: method || 'GET',
+            headers: {
+                ...headers,
+                'Host': targetUrl.host,
+                'Origin': targetUrl.origin,
+                'Referer': targetUrl.origin + '/'
+            }
+        };
+
+        const client = targetUrl.protocol === 'https:' ? https : http;
+        
+        const req = client.request(targetUrl, options, (res) => {
+            let chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+                const buffer = Buffer.concat(chunks);
+                const contentType = res.headers['content-type'] || '';
+                let dataPayload;
+
+                // Handle text encoding conversion safely
+                if (contentType.includes('text') || contentType.includes('json') || contentType.includes('javascript')) {
+                    dataPayload = buffer.toString('utf-8');
+                } else {
+                    dataPayload = buffer.toString('base64'); // Send binaries as base64
+                }
+
+                ws.send(JSON.stringify({
+                    type: 'response',
+                    id: id,
+                    status: res.statusCode,
+                    headers: res.headers,
+                    body: dataPayload,
+                    isBase64: !(contentType.includes('text') || contentType.includes('json') || contentType.includes('javascript'))
+                }));
+            });
+        });
+
+        req.on('error', (err) => {
+            ws.send(JSON.stringify({ type: 'response', id, status: 500, body: err.message }));
+        });
+
+        if (body) {
+            req.write(typeof body === 'object' ? JSON.stringify(body) : body);
+        }
+        req.end();
+
+    } catch (e) {
+        ws.send(JSON.stringify({ type: 'response', id, status: 400, body: 'Invalid Target URL' }));
+    }
+}
+
+server.listen(PORT, () => {
+    console.log(`Proxy server listening on port ${PORT}`);
+});
