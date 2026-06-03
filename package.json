@@ -1,12 +1,9 @@
 {
-  "name": "vulture-v4",
+  "name": "vulture-ws-proxy",
   "version": "1.0.0",
-  "description": "6741",
+  "description": "Educational WebSocket-based web proxy and rewriter",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
   "dependencies": {
-    "testcafe-hammerhead": "^3.1.0"
+    "ws": "^8.18.0"
   }
 }
